@@ -9,12 +9,14 @@ const app    = express();
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
-mongoose.connect("mongodb://127.0.0.1:27017/crm")
-  .then(() => console.log("MongoDB connected!"))
-  .catch(err => console.log("MongoDB error:", err.message));
+const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/crm";
+const PORT      = process.env.PORT || 5000;
+const SECRET        = process.env.JWT_SECRET || "crm_secret_2024";
+const CALLER_SECRET = process.env.CALLER_SECRET || "career2024";
 
-const SECRET        = "crm_secret_2024";
-const CALLER_SECRET = "career2024";   // ← callers must enter this code to register
+mongoose.connect(MONGO_URI)
+  .then(() => console.log("MongoDB Connected:", MONGO_URI.split("@")[1] || "localhost"))
+  .catch(err => console.log("MongoDB error:", err.message));
 
 // ─── SCHEMAS ────────────────────────────────────────────────────────────────
 
@@ -62,79 +64,100 @@ const adminOnly = (req, res, next) => {
 app.post("/api/register", async (req, res) => {
   try {
     const { name, email, password, secretCode } = req.body;
-
-    // Validate secret code
-    if (secretCode !== CALLER_SECRET) {
-      return res.json({ error: "Invalid secret code. Contact your admin." });
+    if (!name || !email || !password || !secretCode) {
+      return res.status(400).json({ error: "All fields are required" });
     }
-
-    // Always register as caller (no admin self-registration)
+    if (secretCode !== CALLER_SECRET) {
+      return res.status(403).json({ error: "Invalid secret code. Contact your admin." });
+    }
     const user = await User.create({ name, email, password, role: "caller" });
     res.json({ message: "Account created successfully!", id: user._id });
   } catch (e) {
-    res.json({ error: "Email already exists" });
+    res.status(400).json({ error: "Email already exists" });
   }
 });
 
-// Admin creation route (run once manually via POST, then disable or keep for internal use)
+// Admin creation route
 app.post("/api/create-admin", async (req, res) => {
   try {
     const { name, email, password, adminKey } = req.body;
+    if (!name || !email || !password || !adminKey) {
+      return res.status(400).json({ error: "All fields are required" });
+    }
     if (adminKey !== "ADMIN_MASTER_KEY_2024") {
       return res.status(403).json({ error: "Forbidden" });
     }
     const existing = await User.findOne({ role: "admin" });
-    if (existing) return res.json({ error: "Admin already exists" });
+    if (existing) return res.status(400).json({ error: "Admin already exists" });
     const user = await User.create({ name, email, password, role: "admin" });
     res.json({ message: "Admin created", id: user._id });
   } catch (e) {
-    res.json({ error: e.message });
+    res.status(500).json({ error: e.message });
   }
 });
 
 app.post("/api/login", async (req, res) => {
-  const { email, password } = req.body;
-  const user = await User.findOne({ email, password });
-  if (!user) return res.json({ error: "Invalid credentials" });
-  const token = jwt.sign({ id: user._id, role: user.role, name: user.name }, SECRET, { expiresIn: "12h" });
-  res.json({ token, user: { id: user._id, name: user.name, role: user.role } });
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: "Email and password are required" });
+    }
+    const user = await User.findOne({ email, password });
+    if (!user) return res.status(401).json({ error: "Invalid credentials" });
+    const token = jwt.sign(
+      { id: user._id, role: user.role, name: user.name },
+      SECRET,
+      { expiresIn: "12h" }
+    );
+    res.json({ token, user: { id: user._id, name: user.name, role: user.role } });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ─── USERS ───────────────────────────────────────────────────────────────────
 
 app.get("/api/users", auth, adminOnly, async (req, res) => {
-  const users = await User.find({}, "-password");
-  res.json(users);
+  try {
+    const users = await User.find({}, "-password");
+    res.json(users);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ─── LEADS ───────────────────────────────────────────────────────────────────
 
 // GET leads — callers see only their own, admins see all
 app.get("/api/leads", auth, async (req, res) => {
-  const { search } = req.query;
-  let query = {};
+  try {
+    const { search } = req.query;
+    let query = {};
 
-  if (req.user.role === "caller") {
-    query.assignedTo = req.user.id;
-  }
-
-  if (search) {
-    const searchConditions = [
-      { name:  { $regex: search, $options: "i" } },
-      { phone: { $regex: search, $options: "i" } }
-    ];
     if (req.user.role === "caller") {
-      query.$and = [{ assignedTo: req.user.id }, { $or: searchConditions }];
-      delete query.assignedTo;
-    } else {
-      query.$or = searchConditions;
+      query.assignedTo = req.user.id;
     }
-  }
 
-  const leads = await Lead.find(query)
-    .populate("assignedTo", "name email")
-    .sort({ createdAt: -1 });
-  res.json(leads);
+    if (search) {
+      const searchConditions = [
+        { name:  { $regex: search, $options: "i" } },
+        { phone: { $regex: search, $options: "i" } }
+      ];
+      if (req.user.role === "caller") {
+        query.$and = [{ assignedTo: req.user.id }, { $or: searchConditions }];
+        delete query.assignedTo;
+      } else {
+        query.$or = searchConditions;
+      }
+    }
+
+    const leads = await Lead.find(query)
+      .populate("assignedTo", "name email")
+      .sort({ createdAt: -1 });
+    res.json(leads);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // POST single lead
@@ -143,16 +166,23 @@ app.post("/api/leads", auth, async (req, res) => {
     const lead = await Lead.create(req.body);
     const populated = await Lead.findById(lead._id).populate("assignedTo", "name email");
     res.json(populated);
-  } catch (e) { res.json({ error: e.message }); }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // POST bulk leads (admin only)
 app.post("/api/leads/bulk", auth, adminOnly, async (req, res) => {
   try {
     const { leads } = req.body;
+    if (!leads || !Array.isArray(leads)) {
+      return res.status(400).json({ error: "leads must be an array" });
+    }
     const inserted = await Lead.insertMany(leads);
     res.json({ message: `${inserted.length} leads imported`, count: inserted.length });
-  } catch (e) { res.json({ error: e.message }); }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // PUT update lead
@@ -160,14 +190,27 @@ app.put("/api/leads/:id", auth, async (req, res) => {
   try {
     const lead = await Lead.findByIdAndUpdate(req.params.id, req.body, { new: true })
       .populate("assignedTo", "name email");
+    if (!lead) return res.status(404).json({ error: "Lead not found" });
     res.json(lead);
-  } catch (e) { res.json({ error: e.message }); }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // DELETE lead (admin only)
 app.delete("/api/leads/:id", auth, adminOnly, async (req, res) => {
-  await Lead.findByIdAndDelete(req.params.id);
-  res.json({ message: "Deleted" });
+  try {
+    await Lead.findByIdAndDelete(req.params.id);
+    res.json({ message: "Deleted" });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── HEALTH CHECK ────────────────────────────────────────────────────────────
+
+app.get("/", (req, res) => {
+  res.json({ status: "CRM Backend is running" });
 });
 
 // ─── SERVER ──────────────────────────────────────────────────────────────────
@@ -175,4 +218,4 @@ app.delete("/api/leads/:id", auth, adminOnly, async (req, res) => {
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-server.listen(5000, () => console.log("CRM Backend Running on port 5000"));
+server.listen(PORT, () => console.log(`CRM Backend Running on port ${PORT}`));
